@@ -74,6 +74,8 @@ All paths are forwarded transparently (`/v1/chat/completions`, `/v1/models`, etc
 
 ## How verification works
 
+All steps happen on a **single TCP connection** to the backend. This guarantees verification and request forwarding target the exact same server (no DNS round-robin mismatch), and that **no client data is sent before verification completes**.
+
 ```
 Client                     verified-proxy                  *.completions.near.ai (TEE)
   |                             |                                    |
@@ -81,26 +83,26 @@ Client                     verified-proxy                  *.completions.near.ai
   |   model: GLM-5-FP8         |                                    |
   |                             |-- resolve model → domain           |
   |                             |                                    |
-  |                             |== TLS connect (no CA check) ======>|
+  |                             |== TLS handshake ==================>|
+  |                             |   (no HTTP data sent yet)          |
   |                             |   extract SPKI from cert           |
   |                             |                                    |
-  |                             |   SPKI in cache? ─── yes ──> forward request
-  |                             |       |                            |
-  |                             |       no                           |
-  |                             |       |                            |
-  |                             |   Single TLS connection:           |
-  |                             |   ├─ extract live SPKI hash        |
-  |                             |   └─ GET /v1/attestation/report    |
+  |                             |   SPKI in cache?                   |
+  |                             |   ├─ yes → skip to step 4          |
+  |                             |   └─ no  → verify on same conn:    |
   |                             |                                    |
-  |                             |   Verify:                          |
+  |                             |-- GET /attestation/report -------->|
+  |                             |<-- attestation JSON ---------------|
+  |                             |                                    |
+  |                             |   Verify (local, no network):      |
   |                             |   ├─ Intel TDX quote (dcap-qvl)    |
   |                             |   ├─ report_data binds signing     |
   |                             |   │  address + TLS cert + nonce    |
   |                             |   └─ live SPKI == attested SPKI    |
-  |                             |                                    |
   |                             |   Cache verified SPKI              |
   |                             |                                    |
-  |                             |-- Forward original request ------->|
+  |                             |-- Forward client request --------->|
+  |                             |   (only after verification)        |
   |<--- Stream response --------|<--- Stream response ---------------|
 ```
 
@@ -113,10 +115,22 @@ Client                     verified-proxy                  *.completions.near.ai
 | SPKI match | The live TLS connection terminates inside the TEE |
 | Nonce | The attestation is fresh (not replayed) |
 
+### Security guarantee
+
+**No client data is sent before verification.** The proxy uses `http.client.HTTPSConnection` which separates TLS handshake (`connect()`) from HTTP request sending (`request()`). The sequence is:
+
+1. `connect()` — TLS handshake completes, certificate is available
+2. Extract SPKI hash from the certificate
+3. If uncached: `GET /v1/attestation/report` on the same connection → full TDX verification
+4. Only after verification: `request()` sends the client's actual HTTP request
+
+Steps 1-4 all happen on the same TCP connection, so there is no possibility of DNS round-robin routing you to a different (unverified) backend between verification and request.
+
 ### When re-verification happens
 
 - **First request** to a backend — full attestation (~5-10 seconds)
-- **Certificate rotation** — detected automatically, triggers re-attestation
+- **Certificate rotation** — new SPKI detected, triggers re-attestation on the same connection
+- **DNS round-robin** — each unique backend SPKI is verified and cached independently
 - **Cached SPKI match** — no attestation needed, request forwarded immediately
 
 ## CLI options

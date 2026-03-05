@@ -6,8 +6,8 @@ A local HTTP proxy that forwards requests to *.completions.near.ai backends
 over TLS, verifying each backend's certificate is bound to an Intel TDX TEE.
 
 On first contact with a backend (or when its cert changes), the proxy runs
-full TDX attestation. Once verified, the SPKI hash is cached and subsequent
-requests just compare the live cert against the cache.
+full TDX attestation on the SAME connection before sending any client data.
+Once verified, the SPKI hash is cached and subsequent requests skip attestation.
 
 Usage:
     python proxy.py [--port 8080] [--host 127.0.0.1]
@@ -90,50 +90,12 @@ def compute_spki_hash(cert_der: bytes) -> str:
 # TEE attestation verification
 # ---------------------------------------------------------------------------
 
-_spki_cache: dict[str, str] = {}  # domain -> verified SPKI hash
+_spki_cache: dict[str, set[str]] = {}  # domain -> set of verified SPKI hashes
 _verify_locks: dict[str, asyncio.Lock] = {}
 
 
-def _fetch_attestation_and_spki(
-    hostname: str, port: int, nonce: str
-) -> tuple[dict, str]:
-    """Single TLS connection: extract live SPKI + fetch attestation report."""
-    ctx = ssl.create_default_context()
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-
-    conn = http.client.HTTPSConnection(hostname, port, context=ctx, timeout=60)
-    conn.connect()
-
-    cert_der = conn.sock.getpeercert(binary_form=True)
-    if not cert_der:
-        conn.close()
-        raise RuntimeError("No certificate from server")
-    live_spki = compute_spki_hash(cert_der)
-
-    path = (
-        "/v1/attestation/report"
-        f"?include_tls_fingerprint=true&nonce={nonce}&signing_algo=ecdsa"
-    )
-    conn.request("GET", path, headers={"Host": hostname})
-    resp = conn.getresponse()
-    body = resp.read()
-    conn.close()
-
-    if resp.status != 200:
-        raise RuntimeError(f"Attestation HTTP {resp.status}: {body.decode()}")
-
-    return json.loads(body), live_spki
-
-
-async def verify_backend(domain: str) -> str:
-    """Run full TDX attestation for a backend. Returns verified SPKI hash."""
-    nonce = secrets.token_hex(32)
-
-    attestation, live_spki = await asyncio.to_thread(
-        _fetch_attestation_and_spki, domain, 443, nonce
-    )
-
+async def _verify_attestation(attestation: dict, nonce: str, live_spki: str) -> None:
+    """Verify TDX quote and report data bindings. Raises on failure."""
     tls_fp = attestation.get("tls_cert_fingerprint")
     if not tls_fp:
         raise RuntimeError("Attestation missing tls_cert_fingerprint")
@@ -143,18 +105,16 @@ async def verify_backend(domain: str) -> str:
     result = await dcap_qvl.get_collateral_and_verify(quote_bytes)
     result_json = json.loads(result.to_json())
     td10 = result_json["report"]["TD10"]
-    report_data_hex = td10["report_data"]
+    report_data = bytes.fromhex(td10["report_data"].removeprefix("0x"))
 
     # 2. Verify report data binds signing address + TLS fingerprint + nonce
-    report_data = bytes.fromhex(report_data_hex.removeprefix("0x"))
-
     signing_algo = attestation.get("signing_algo", "ecdsa").lower()
     addr = attestation["signing_address"]
     addr_bytes = bytes.fromhex(addr.removeprefix("0x") if signing_algo == "ecdsa" else addr)
     fp_bytes = bytes.fromhex(tls_fp)
 
-    expected_hash = sha256(addr_bytes + fp_bytes).digest()
-    if report_data[:32] != expected_hash:
+    expected = sha256(addr_bytes + fp_bytes).digest()
+    if report_data[:32] != expected:
         raise RuntimeError("Report data does not bind signing address + TLS fingerprint")
     if report_data[32:].hex() != nonce:
         raise RuntimeError("Report data nonce mismatch")
@@ -163,38 +123,67 @@ async def verify_backend(domain: str) -> str:
     if live_spki != tls_fp:
         raise RuntimeError(f"Live SPKI {live_spki} != attested {tls_fp}")
 
-    log.info("Verified %s  spki=%s…", domain, live_spki[:16])
-    return live_spki
+
+def _connect(domain: str) -> tuple[http.client.HTTPSConnection, str]:
+    """TLS handshake only — no HTTP data sent. Returns (conn, spki_hash)."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    conn = http.client.HTTPSConnection(domain, 443, context=ctx, timeout=300)
+    conn.connect()
+
+    cert_der = conn.sock.getpeercert(binary_form=True)
+    if not cert_der:
+        conn.close()
+        raise RuntimeError("No certificate from server")
+
+    return conn, compute_spki_hash(cert_der)
 
 
-async def ensure_verified(domain: str, live_spki: str) -> None:
-    """Check cache or run attestation. Raises on failure."""
-    if _spki_cache.get(domain) == live_spki:
-        return
+def _fetch_attestation(conn: http.client.HTTPSConnection, domain: str, nonce: str) -> dict:
+    """Fetch attestation report over an existing connection. No new TLS handshake."""
+    path = (
+        "/v1/attestation/report"
+        f"?include_tls_fingerprint=true&nonce={nonce}&signing_algo=ecdsa"
+    )
+    conn.request("GET", path, headers={"Host": domain, "Connection": "keep-alive"})
+    resp = conn.getresponse()
+    body = resp.read()
+    if resp.status != 200:
+        raise RuntimeError(f"Attestation HTTP {resp.status}: {body.decode()}")
+    return json.loads(body)
 
-    if domain not in _verify_locks:
-        _verify_locks[domain] = asyncio.Lock()
 
-    async with _verify_locks[domain]:
-        # Double-check after lock
-        if _spki_cache.get(domain) == live_spki:
-            return
-        verified = await verify_backend(domain)
-        if verified != live_spki:
-            raise RuntimeError(
-                f"Verified SPKI {verified} doesn't match connection SPKI {live_spki}"
-            )
-        _spki_cache[domain] = verified
+def _send_request(
+    conn: http.client.HTTPSConnection, method: str, path: str,
+    headers: dict, body: bytes | None,
+) -> tuple[int, dict[str, str], http.client.HTTPResponse]:
+    """Send the client's request over an already-verified connection."""
+    conn.request(method, path, body=body, headers=headers)
+    resp = conn.getresponse()
+    return resp.status, dict(resp.getheaders()), resp
+
+
+def _read_chunk(resp: http.client.HTTPResponse, size: int = 65536) -> bytes:
+    """Read up to `size` bytes from the response. Returns b'' at EOF."""
+    return resp.read(size)
 
 
 # ---------------------------------------------------------------------------
 # Proxy handler
+#
+# Request flow on a SINGLE backend connection:
+#
+#   1. connect()          — TLS handshake, extract SPKI  (no HTTP data sent)
+#   2. GET /attestation   — only if SPKI not in cache    (verification data only)
+#   3. verify TDX quote   — async, uses dcap-qvl
+#   4. request()          — send client's actual request (only after verification)
+#   5. stream response    — forward chunks back to client
+#
+# Using one connection for steps 1-5 guarantees we verify the exact backend
+# we're talking to, even with DNS round-robin.
 # ---------------------------------------------------------------------------
-
-_backend_ssl = ssl.create_default_context()
-_backend_ssl.check_hostname = False
-_backend_ssl.verify_mode = ssl.CERT_NONE
-
 
 async def proxy_handler(request: aiohttp.web.Request) -> aiohttp.web.StreamResponse:
     # --- Determine backend domain ---
@@ -221,41 +210,64 @@ async def proxy_handler(request: aiohttp.web.Request) -> aiohttp.web.StreamRespo
             status=400,
         )
 
-    # --- Forward request to backend ---
-    url = f"https://{domain}{request.path_qs}"
-    headers = {k: v for k, v in request.headers.items() if k.lower() != "host"}
-    headers["Host"] = domain
-    headers.pop("X-Backend-Domain", None)
-
-    connector = aiohttp.TCPConnector(ssl=_backend_ssl)
+    # --- Phase 1: TLS handshake (no HTTP data sent yet) ---
     try:
-        async with aiohttp.ClientSession(connector=connector) as session:
-            async with session.request(
-                request.method, url, headers=headers, data=body, timeout=aiohttp.ClientTimeout(total=300),
-            ) as backend_resp:
-                # --- Extract live SPKI from TLS connection ---
-                transport = backend_resp.connection.transport
-                ssl_obj = transport.get_extra_info("ssl_object")
-                cert_der = ssl_obj.getpeercert(binary_form=True)
-                live_spki = compute_spki_hash(cert_der)
+        conn, live_spki = await asyncio.to_thread(_connect, domain)
+    except Exception as e:
+        return aiohttp.web.json_response(
+            {"error": {"message": f"Backend connection failed: {e}"}}, status=502
+        )
 
-                # --- Verify TEE attestation if SPKI is new ---
-                await ensure_verified(domain, live_spki)
+    try:
+        # --- Phase 2: Verify SPKI (fetch attestation on same connection if needed) ---
+        if live_spki not in _spki_cache.get(domain, set()):
+            if domain not in _verify_locks:
+                _verify_locks[domain] = asyncio.Lock()
 
-                # --- Stream response back to client ---
-                resp = aiohttp.web.StreamResponse(
-                    status=backend_resp.status,
-                    headers={
-                        k: v
-                        for k, v in backend_resp.headers.items()
-                        if k.lower() not in ("transfer-encoding", "content-encoding", "content-length")
-                    },
-                )
-                await resp.prepare(request)
-                async for chunk in backend_resp.content.iter_any():
-                    await resp.write(chunk)
-                await resp.write_eof()
-                return resp
+            async with _verify_locks[domain]:
+                # Double-check after acquiring lock
+                if live_spki not in _spki_cache.get(domain, set()):
+                    nonce = secrets.token_hex(32)
+                    log.info("Verifying %s (spki=%s…)", domain, live_spki[:16])
+
+                    attestation = await asyncio.to_thread(
+                        _fetch_attestation, conn, domain, nonce
+                    )
+                    await _verify_attestation(attestation, nonce, live_spki)
+
+                    _spki_cache.setdefault(domain, set()).add(live_spki)
+                    log.info("Verified  %s (spki=%s…)", domain, live_spki[:16])
+
+        # --- Phase 3: Send client request (only after verification) ---
+        fwd_headers = {
+            k: v for k, v in request.headers.items()
+            if k.lower() not in ("host", "x-backend-domain", "transfer-encoding")
+        }
+        fwd_headers["Host"] = domain
+        if body:
+            fwd_headers["Content-Length"] = str(len(body))
+
+        status, resp_headers, backend_resp = await asyncio.to_thread(
+            _send_request, conn, request.method, request.path_qs, fwd_headers, body
+        )
+
+        # --- Phase 4: Stream response back to client ---
+        filtered = {
+            k: v for k, v in resp_headers.items()
+            if k.lower() not in ("transfer-encoding", "content-encoding", "content-length", "connection")
+        }
+        response = aiohttp.web.StreamResponse(status=status, headers=filtered)
+        await response.prepare(request)
+
+        while True:
+            chunk = await asyncio.to_thread(_read_chunk, backend_resp)
+            if not chunk:
+                break
+            await response.write(chunk)
+
+        await response.write_eof()
+        return response
+
     except RuntimeError as e:
         log.warning("Verification failed for %s: %s", domain, e)
         return aiohttp.web.json_response(
@@ -268,6 +280,8 @@ async def proxy_handler(request: aiohttp.web.Request) -> aiohttp.web.StreamRespo
             {"error": {"message": f"Proxy error: {e}"}},
             status=502,
         )
+    finally:
+        await asyncio.to_thread(conn.close)
 
 
 # ---------------------------------------------------------------------------
